@@ -1,0 +1,17 @@
+/target
+
+# Local build artifacts
+/dist
+*.dmg
+
+# Never commit credentials or account data
+*.db
+*.session
+config.json
+chats.txt
+.env
+.env.*
+
+# Editor / OS noise
+.DS_Store
+*.swp

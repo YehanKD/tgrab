@@ -1,0 +1,33 @@
+name: macos
+
+# Builds a universal .app + .dmg on GitHub's macOS runners.
+# No Mac needed locally: push a tag, download the artifact.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  dmg:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build .app and .dmg
+        run: ./scripts/macos-bundle.sh
+
+      - name: Upload dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgrab-macos
+          path: dist/*.dmg
+          if-no-files-found: error

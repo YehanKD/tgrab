@@ -129,11 +129,43 @@ git tag v0.1.0 && git push --tags
 ### Gatekeeper
 
 The build is ad-hoc signed, not notarized — notarization needs a paid Apple
-Developer ID. On another Mac, first launch requires right-click → Open, or:
+Developer ID. On another Mac you will see *"Apple could not verify tgrab is free
+of malware"*.
+
+**macOS 15 (Sequoia) and later removed the right-click → Open bypass.** Use one
+of these instead:
 
 ```sh
+# fastest — clears the quarantine flag the download set
+xattr -dr com.apple.quarantine /Applications/tgrab.app
+open /Applications/tgrab.app
+```
+
+Or: attempt to launch once, then System Settings → Privacy & Security → scroll
+down → **Open Anyway** (the button only appears for about an hour after a
+blocked launch attempt). Authenticate with Touch ID or your password.
+
+If macOS instead reports the app is **damaged**, the ad-hoc signature did not
+survive the copy — re-sign it locally:
+
+```sh
+codesign --force --deep --sign - /Applications/tgrab.app
 xattr -dr com.apple.quarantine /Applications/tgrab.app
 ```
+
+To inspect what macOS thinks of the bundle:
+
+```sh
+codesign -dv --verbose=2 /Applications/tgrab.app
+spctl -a -vv /Applications/tgrab.app
+```
+
+Do **not** run `spctl --master-disable` — that turns Gatekeeper off for every app
+on the machine to fix one bundle.
+
+Permanent fix: sign with a Developer ID certificate and notarize with
+`notarytool` (requires a paid Apple Developer account). The workflow is ready for
+it — add the certificate as a repo secret and a signing step before `hdiutil`.
 
 ### Why not cross-compile from Linux
 

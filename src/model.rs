@@ -73,6 +73,11 @@ pub enum Cmd {
         parts: usize,
         concurrent: usize,
     },
+    Forward {
+        chat: usize,
+        msg_ids: Vec<i32>,
+        to: usize,
+    },
 }
 
 pub enum Ev {
@@ -104,6 +109,10 @@ pub enum Ev {
     Skipped {
         key: String,
         path: String,
+    },
+    Forwarded {
+        done: usize,
+        total: usize,
     },
     Prog {
         key: String,

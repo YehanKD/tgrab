@@ -424,6 +424,56 @@ async fn run(
                     let _ = tx.send(Ev::Media { chat, items: rows });
                 }
 
+                Cmd::Forward { chat, msg_ids, to } => {
+                    let c = client.as_ref().ok_or_else(|| anyhow::anyhow!("not connected"))?.clone();
+                    let from = *peers.get(chat).ok_or_else(|| anyhow::anyhow!("bad source chat"))?;
+                    let dest: tl::enums::InputPeer = if to == usize::MAX {
+                        tl::enums::InputPeer::PeerSelf
+                    } else {
+                        (*peers.get(to).ok_or_else(|| anyhow::anyhow!("bad destination"))?).into()
+                    };
+                    eprintln!("[fwd] {} msgs {} -> {}", msg_ids.len(), chat, to);
+                    let total = msg_ids.len();
+                    let mut done = 0usize;
+                    for chunk in msg_ids.chunks(100) {
+                        let seed = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as i64)
+                            .unwrap_or(1);
+                        let random_id: Vec<i64> = (0..chunk.len())
+                            .map(|i| seed.wrapping_add(i as i64 * 7919) | 1)
+                            .collect();
+                        c.invoke(&tl::functions::messages::ForwardMessages {
+                            silent: false,
+                            background: false,
+                            with_my_score: false,
+                            drop_author: false,
+                            drop_media_captions: false,
+                            noforwards: false,
+                            allow_paid_floodskip: false,
+                            from_ephemeral: false,
+                            from_peer: from.into(),
+                            id: chunk.to_vec(),
+                            random_id,
+                            to_peer: dest.clone(),
+                            top_msg_id: None,
+                            reply_to: None,
+                            schedule_date: None,
+                            schedule_repeat_period: None,
+                            send_as: None,
+                            quick_reply_shortcut: None,
+                            effect: None,
+                            video_timestamp: None,
+                            allow_paid_stars: None,
+                            suggested_post: None,
+                        })
+                        .await?;
+                        done += chunk.len();
+                        let _ = tx.send(Ev::Forwarded { done, total });
+                        ctx.request_repaint();
+                    }
+                    eprintln!("[fwd] done {done}/{total}");
+                }
                 Cmd::Download { chat, msg_ids, dir, parts, concurrent } => {
                     let c = client.as_ref().ok_or_else(|| anyhow::anyhow!("not connected"))?.clone();
                     let msgs = cache.get(&chat).ok_or_else(|| anyhow::anyhow!("no index for chat"))?;

@@ -104,6 +104,10 @@ struct App {
     pick_rx: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
     dl_bytes: u64,
     speed: std::collections::VecDeque<(std::time::Instant, u64)>,
+    fwd_open: bool,
+    fwd_filter: String,
+    fwd_target: Option<usize>,
+    fwd_groups: bool,
     limit: usize,
     queue: Vec<QRow>,
     qidx: HashMap<String, usize>,
@@ -147,6 +151,10 @@ impl App {
             pick_rx: None,
             dl_bytes: 0,
             speed: std::collections::VecDeque::new(),
+            fwd_open: false,
+            fwd_filter: String::new(),
+            fwd_target: None,
+            fwd_groups: false,
             limit: 500,
             queue: Vec::new(),
             qidx: HashMap::new(),
@@ -281,6 +289,13 @@ impl App {
                         r.total = total;
                         r.state = QState::Run;
                     }
+                }
+                Ev::Forwarded { done, total } => {
+                    self.status = if done >= total {
+                        format!("forwarded {total} message(s)")
+                    } else {
+                        format!("forwarding… {done}/{total}")
+                    };
                 }
                 Ev::Skipped { key, path: _ } => {
                     if let Some(&i) = self.qidx.get(&key) {
@@ -772,6 +787,18 @@ impl eframe::App for App {
                         .collect();
                     self.start_download(ids);
                 }
+                if ui
+                    .add_enabled(
+                        n > 0,
+                        egui::Button::new(format!("Forward {n}")),
+                    )
+                    .on_hover_text("forward the selected messages to one of your channels")
+                    .clicked()
+                {
+                    self.fwd_open = true;
+                    self.fwd_target = None;
+                    self.fwd_filter.clear();
+                }
             });
             ui.horizontal(|ui| {
                 match self.media_count {
@@ -925,6 +952,126 @@ impl eframe::App for App {
                         });
                 });
         });
+        self.forward_window(&ctx);
+    }
+}
+
+impl App {
+    /// Modal picker: choose one of the user's channels to forward the selection into.
+    fn forward_window(&mut self, ctx: &egui::Context) {
+        if !self.fwd_open {
+            return;
+        }
+        let ids: Vec<i32> = self
+            .media
+            .iter()
+            .filter(|m| m.selected)
+            .map(|m| m.msg_id)
+            .collect();
+        let n = ids.len();
+        let mut open = true;
+        let mut close = false;
+        let mut go: Option<usize> = None;
+
+        egui::Window::new("Forward to…")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(460.0)
+            .default_height(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("forward {n} selected message(s) to:"));
+                ui.horizontal(|ui| {
+                    ui.label("filter");
+                    ui.text_edit_singleline(&mut self.fwd_filter);
+                });
+                ui.checkbox(&mut self.fwd_groups, "include groups");
+                ui.separator();
+
+                let q = self.fwd_filter.trim().to_lowercase();
+                let mut rows: Vec<(usize, String, bool)> = Vec::new();
+                for c in &self.chats {
+                    let wanted = c.kind == "channel" || (self.fwd_groups && c.kind == "group");
+                    if !wanted {
+                        continue;
+                    }
+                    if !q.is_empty() && !c.name.to_lowercase().contains(&q) {
+                        continue;
+                    }
+                    let private = c.kind == "channel" && c.username.is_none();
+                    rows.push((c.idx, c.name.clone(), private));
+                }
+                // private channels first, then public ones, then groups; A-Z within each
+                rows.sort_by(|a, b| {
+                    b.2.cmp(&a.2)
+                        .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+                });
+                if rows.is_empty() && q.is_empty() {
+                    ui.weak("no channels yet — create one in Telegram first");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        // Saved Messages always works and is a safe place to park things
+                        if q.is_empty() || "saved messages".contains(&q) {
+                            let sel = self.fwd_target == Some(usize::MAX);
+                            if ui
+                                .selectable_label(sel, "📥 Saved Messages (you)")
+                                .clicked()
+                            {
+                                self.fwd_target = Some(usize::MAX);
+                            }
+                        }
+                        for (idx, name, private) in &rows {
+                            let sel = self.fwd_target == Some(*idx);
+                            let label = if *private {
+                                format!("🔒 {name}")
+                            } else {
+                                format!("    {name}")
+                            };
+                            if ui.selectable_label(sel, label).clicked() {
+                                self.fwd_target = Some(*idx);
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let can = self.fwd_target.is_some() && n > 0;
+                    if ui
+                        .add_enabled(can, egui::Button::new(format!("Forward {n}")))
+                        .clicked()
+                    {
+                        go = self.fwd_target;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                    if let Some(t) = self.fwd_target {
+                        if t == usize::MAX {
+                            ui.weak("→ Saved Messages");
+                        } else if let Some(c) = self.chats.iter().find(|c| c.idx == t) {
+                            ui.weak(format!("→ {}", c.name));
+                        }
+                    }
+                });
+            });
+
+        if let Some(to) = go {
+            if let Some(chat) = self.media_chat {
+                let _ = self.tx.send(Cmd::Forward {
+                    chat,
+                    msg_ids: ids,
+                    to,
+                });
+                self.status = format!("forwarding {n} message(s)…");
+            }
+            close = true;
+        }
+        if close || !open {
+            self.fwd_open = false;
+        }
     }
 }
 

@@ -26,6 +26,8 @@ dirs = "6"
 open = "5"
 qrcode = "0.14"
 base64 = "0.22"
+rfd = "0.15"
+pollster = "0.4"
 
 [profile.dev]
 opt-level = 1

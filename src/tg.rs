@@ -450,7 +450,7 @@ async fn run(
                     if skipped > 0 {
                         eprintln!("[dl] skipped {} already on disk", skipped);
                     }
-                    let sem = Arc::new(tokio::sync::Semaphore::new(concurrent.clamp(1, 8)));
+                    let sem = Arc::new(tokio::sync::Semaphore::new(concurrent.clamp(1, 16)));
                     let mut handles = Vec::new();
                     for (key, media, size, path) in jobs {
                         let c = c.clone();
@@ -572,7 +572,7 @@ async fn download_one(
     }
     let f = Arc::new(f);
     let total_chunks = ((size as usize).div_ceil(CHUNK)).max(1);
-    let parts = parts.clamp(1, 8).min(total_chunks);
+    let parts = parts.clamp(1, 16).min(total_chunks);
 
     let mut handles = Vec::new();
     for p in 0..parts {

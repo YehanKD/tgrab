@@ -101,6 +101,9 @@ struct App {
     scanning_all: bool,
     scan_progress: Option<(usize, usize)>,
     sort: SortMode,
+    pick_rx: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
+    dl_bytes: u64,
+    speed: std::collections::VecDeque<(std::time::Instant, u64)>,
     limit: usize,
     queue: Vec<QRow>,
     qidx: HashMap<String, usize>,
@@ -141,6 +144,9 @@ impl App {
             scanning_all: false,
             scan_progress: None,
             sort: SortMode::Newest,
+            pick_rx: None,
+            dl_bytes: 0,
+            speed: std::collections::VecDeque::new(),
             limit: 500,
             queue: Vec::new(),
             qidx: HashMap::new(),
@@ -173,6 +179,24 @@ impl App {
 
     fn pump(&mut self) -> bool {
         let mut any = false;
+        if self.pick_rx.is_some() {
+            let res = self.pick_rx.as_ref().map(|rx| rx.try_recv());
+            match res {
+                Some(Ok(Some(dir))) => {
+                    self.pick_rx = None;
+                    self.cfg.out_dir = dir.display().to_string();
+                    save_cfg(&self.cfg);
+                    self.status = format!("downloads go to {}", dir.display());
+                }
+                Some(Ok(None)) => {
+                    self.pick_rx = None;
+                    self.status = "folder selection cancelled".to_string();
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => self.pick_rx = None,
+                _ => {}
+            }
+        }
+
         while let Ok(ev) = self.rx.try_recv() {
             any = true;
             match ev {
@@ -250,6 +274,7 @@ impl App {
                     }
                 }
                 Ev::Prog { key, done, total } => {
+                    self.dl_bytes += done as u64;
                     if let Some(&i) = self.qidx.get(&key) {
                         let r = &mut self.queue[i];
                         r.done += done;
@@ -344,7 +369,10 @@ impl App {
             return;
         }
         let dir = self.chat_dir(chat);
-        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.status = format!("cannot create {}: {e}", dir.display());
+            return;
+        }
 
         for m in self.media.iter().filter(|m| ids.contains(&m.msg_id)) {
             let key = format!("{chat}:{}", m.msg_id);
@@ -366,8 +394,8 @@ impl App {
             chat,
             msg_ids: ids,
             dir,
-            parts: self.cfg.parts.clamp(1, 8),
-            concurrent: self.cfg.concurrent.clamp(1, 8),
+            parts: self.cfg.parts.clamp(1, 16),
+            concurrent: self.cfg.concurrent.clamp(1, 16),
         });
         self.downloading = true;
         self.status = "downloading".into();
@@ -536,6 +564,44 @@ impl eframe::App for App {
                         ui.label(format!("{done} done, {failed} failed"));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Realtime throughput: sliding ~600 ms window over byte deltas,
+                        // recomputed every frame rather than on a 1 s tick.
+                        let now = std::time::Instant::now();
+                        self.speed.push_back((now, self.dl_bytes));
+                        while self.speed.len() > 2
+                            && now.duration_since(self.speed[0].0).as_millis() > 600
+                        {
+                            self.speed.pop_front();
+                        }
+                        let (t0, b0) = *self.speed.front().unwrap_or(&(now, self.dl_bytes));
+                        let dt = now.duration_since(t0).as_secs_f64();
+                        let mbps = if dt > 0.10 && self.dl_bytes > b0 {
+                            (self.dl_bytes - b0) as f64 / dt / 1_000_000.0
+                        } else {
+                            0.0
+                        };
+                        if mbps > 0.0 {
+                            ui.label(
+                                egui::RichText::new(format!("{mbps:.1} MB/s"))
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(120, 205, 255)),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:.0} MB",
+                                    self.dl_bytes as f64 / 1_000_000.0
+                                ))
+                                .weak(),
+                            );
+                        } else if self.dl_bytes > 0 {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:.0} MB",
+                                    self.dl_bytes as f64 / 1_000_000.0
+                                ))
+                                .weak(),
+                            );
+                        }
                         if ui.button("Open folder").clicked() {
                             let d = match self.media_chat {
                                 Some(c) => self.chat_dir(c),
@@ -637,7 +703,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Media");
                 ui.separator();
                 ui.label("scan last");
@@ -754,6 +820,76 @@ impl eframe::App for App {
                     self.sort = picked;
                     self.apply_sort();
                 }
+            });
+            ui.separator();
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("save to");
+                let base = self.base_dir();
+                ui.add(
+                    egui::Label::new(egui::RichText::new(base.display().to_string()).monospace())
+                        .truncate(),
+                );
+                if ui
+                    .button("Choose…")
+                    .on_hover_text("pick a drive or folder — each chat gets its own subfolder")
+                    .clicked()
+                    && self.pick_rx.is_none()
+                {
+                    let start = if base.exists() {
+                        base.clone()
+                    } else {
+                        dirs::home_dir().unwrap_or_default()
+                    };
+                    // Run the native picker off the UI thread: blocking the main
+                    // thread makes the compositor mark the window "not responding"
+                    // (and on macOS the async API is the supported path).
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let picked = pollster::block_on(
+                            rfd::AsyncFileDialog::new()
+                                .set_title("Choose download folder")
+                                .set_directory(start)
+                                .pick_folder(),
+                        )
+                        .map(|h| h.path().to_path_buf());
+                        let _ = tx.send(picked);
+                    });
+                    self.pick_rx = Some(rx);
+                    self.status = "waiting for folder selection…".to_string();
+                }
+                if !self.cfg.out_dir.is_empty()
+                    && ui
+                        .button("Reset")
+                        .on_hover_text("back to the default folder")
+                        .clicked()
+                {
+                    self.cfg.out_dir.clear();
+                    save_cfg(&self.cfg);
+                    self.status = "downloads go to the default folder".to_string();
+                }
+                ui.separator();
+                ui.label("parallel")
+                    .on_hover_text("files at once × parallel parts per file = open streams");
+                let mut files = self.cfg.concurrent.clamp(1, 16);
+                if ui
+                    .add(egui::DragValue::new(&mut files).range(1..=16).suffix(" files"))
+                    .changed()
+                {
+                    self.cfg.concurrent = files;
+                    save_cfg(&self.cfg);
+                }
+                let mut parts = self.cfg.parts.clamp(1, 16);
+                if ui
+                    .add(egui::DragValue::new(&mut parts).range(1..=16).suffix(" parts"))
+                    .changed()
+                {
+                    self.cfg.parts = parts;
+                    save_cfg(&self.cfg);
+                }
+                ui.label(
+                    egui::RichText::new(format!("= {} streams", files * parts)).weak(),
+                );
             });
             ui.separator();
 
@@ -912,18 +1048,18 @@ fn load_cfg() -> Config {
                 .join("tgrab")
                 .display()
                 .to_string(),
-            parts: 4,
-            concurrent: 4,
+            parts: 6,
+            concurrent: 6,
         });
     if c.api_id.trim().is_empty() || c.api_hash.trim().is_empty() {
         c.api_id = DEF_API_ID.to_string();
         c.api_hash = DEF_API_HASH.to_string();
     }
     if c.parts == 0 {
-        c.parts = 4;
+        c.parts = 6;
     }
     if c.concurrent == 0 {
-        c.concurrent = 4;
+        c.concurrent = 6;
     }
     c
 }

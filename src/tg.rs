@@ -432,47 +432,93 @@ async fn run(
                     } else {
                         (*peers.get(to).ok_or_else(|| anyhow::anyhow!("bad destination"))?).into()
                     };
-                    eprintln!("[fwd] {} msgs {} -> {}", msg_ids.len(), chat, to);
-                    let total = msg_ids.len();
+                    // Drop ids the index says have no media: those are what make the
+                    // server reject a whole batch with MEDIA_FILE_INVALID.
+                    let ids: Vec<i32> = match cache.get(&chat) {
+                        Some(msgs) => msg_ids
+                            .iter()
+                            .copied()
+                            .filter(|id| {
+                                msgs.iter()
+                                    .find(|m| m.id() == *id)
+                                    .map(|m| m.media().is_some())
+                                    .unwrap_or(true)
+                            })
+                            .collect(),
+                        None => msg_ids.clone(),
+                    };
+                    let total = ids.len();
+                    eprintln!("[fwd] {} msgs {} -> {} ({} filtered)", msg_ids.len(), chat, to, total);
                     let mut done = 0usize;
-                    for chunk in msg_ids.chunks(100) {
+                    let mut failed = 0usize;
+                    // Work in batches of 100, but split a failing batch in half and retry:
+                    // a single unforwardable file then costs one message, not 100.
+                    let mut stack: Vec<Vec<i32>> = ids.chunks(100).map(|c| c.to_vec()).collect();
+                    stack.reverse();
+                    while let Some(batch) = stack.pop() {
                         let seed = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_nanos() as i64)
                             .unwrap_or(1);
-                        let random_id: Vec<i64> = (0..chunk.len())
+                        let random_id: Vec<i64> = (0..batch.len())
                             .map(|i| seed.wrapping_add(i as i64 * 7919) | 1)
                             .collect();
-                        c.invoke(&tl::functions::messages::ForwardMessages {
-                            silent: false,
-                            background: false,
-                            with_my_score: false,
-                            drop_author: false,
-                            drop_media_captions: false,
-                            noforwards: false,
-                            allow_paid_floodskip: false,
-                            from_ephemeral: false,
-                            from_peer: from.into(),
-                            id: chunk.to_vec(),
-                            random_id,
-                            to_peer: dest.clone(),
-                            top_msg_id: None,
-                            reply_to: None,
-                            schedule_date: None,
-                            schedule_repeat_period: None,
-                            send_as: None,
-                            quick_reply_shortcut: None,
-                            effect: None,
-                            video_timestamp: None,
-                            allow_paid_stars: None,
-                            suggested_post: None,
-                        })
-                        .await?;
-                        done += chunk.len();
-                        let _ = tx.send(Ev::Forwarded { done, total });
-                        ctx.request_repaint();
+                        let res = c
+                            .invoke(&tl::functions::messages::ForwardMessages {
+                                silent: false,
+                                background: false,
+                                with_my_score: false,
+                                drop_author: false,
+                                drop_media_captions: false,
+                                noforwards: false,
+                                allow_paid_floodskip: false,
+                                from_ephemeral: false,
+                                from_peer: from.into(),
+                                id: batch.clone(),
+                                random_id,
+                                to_peer: dest.clone(),
+                                top_msg_id: None,
+                                reply_to: None,
+                                schedule_date: None,
+                                schedule_repeat_period: None,
+                                send_as: None,
+                                quick_reply_shortcut: None,
+                                effect: None,
+                                video_timestamp: None,
+                                allow_paid_stars: None,
+                                suggested_post: None,
+                            })
+                            .await;
+                        match res {
+                            Ok(_) => {
+                                done += batch.len();
+                                let _ = tx.send(Ev::Forwarded { done, total, failed });
+                                ctx.request_repaint();
+                                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                            }
+                            Err(e) if is_fatal_auth(&e) => {
+                                // Account banned / session revoked: stop instantly instead of
+                                // splitting and hammering the API with more doomed requests.
+                                eprintln!("[fwd] aborting on fatal auth error: {e}");
+                                let _ = tx.send(Ev::Err(e.to_string()));
+                                ctx.request_repaint();
+                                break;
+                            }
+                            Err(e) if batch.len() > 1 => {
+                                let mid = batch.len() / 2;
+                                eprintln!("[fwd] batch of {} failed ({}), splitting", batch.len(), e);
+                                stack.push(batch[mid..].to_vec());
+                                stack.push(batch[..mid].to_vec());
+                            }
+                            Err(e) => {
+                                failed += 1;
+                                eprintln!("[fwd] id {} unforwardable: {}", batch[0], e);
+                                let _ = tx.send(Ev::Forwarded { done, total, failed });
+                                ctx.request_repaint();
+                            }
+                        }
                     }
-                    eprintln!("[fwd] done {done}/{total}");
+                    eprintln!("[fwd] done {done}/{total}, {failed} failed");
                 }
                 Cmd::Download { chat, msg_ids, dir, parts, concurrent } => {
                     let c = client.as_ref().ok_or_else(|| anyhow::anyhow!("not connected"))?.clone();
@@ -693,6 +739,15 @@ async fn download_one(
 /// reported. A truncated leftover (killed mid-download) fails the size check and
 /// is fetched again. `expected == 0` means Telegram gave no size, so any
 /// non-empty file counts as complete.
+fn is_fatal_auth<E: std::fmt::Display>(e: &E) -> bool {
+    let s = e.to_string();
+    s.contains("USER_DEACTIVATED")
+        || s.contains("AUTH_KEY_UNREGISTERED")
+        || s.contains("SESSION_REVOKED")
+        || s.contains("USER_BANNED")
+        || s.contains("PHONE_NUMBER_BANNED")
+}
+
 fn already_complete(path: &std::path::Path, expected: u64) -> bool {
     match std::fs::metadata(path) {
         Ok(md) => md.len() > 0 && (expected == 0 || md.len() == expected),

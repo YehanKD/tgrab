@@ -290,9 +290,13 @@ impl App {
                         r.state = QState::Run;
                     }
                 }
-                Ev::Forwarded { done, total } => {
-                    self.status = if done >= total {
-                        format!("forwarded {total} message(s)")
+                Ev::Forwarded { done, total, failed } => {
+                    self.status = if done + failed >= total {
+                        if failed > 0 {
+                            format!("forwarded {done} of {total} — {failed} skipped (media unavailable)")
+                        } else {
+                            format!("forwarded {total} message(s)")
+                        }
                     } else {
                         format!("forwarding… {done}/{total}")
                     };

@@ -113,6 +113,7 @@ pub enum Ev {
     Forwarded {
         done: usize,
         total: usize,
+        failed: usize,
     },
     Prog {
         key: String,

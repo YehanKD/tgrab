@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -692,7 +691,7 @@ async fn download_one(
                 match it.next().await {
                     Ok(Some(data)) => {
                         let off = (idx * CHUNK) as u64;
-                        if let Err(e) = f.write_all_at(&data, off) {
+                        if let Err(e) = write_at(&f, &data, off) {
                             let _ = tx.send(Ev::Fail { key, err: format!("write: {e}") });
                             return;
                         }
@@ -739,6 +738,41 @@ async fn download_one(
 /// reported. A truncated leftover (killed mid-download) fails the size check and
 /// is fetched again. `expected == 0` means Telegram gave no size, so any
 /// non-empty file counts as complete.
+/// Positioned write that works on both Unix and Windows.
+fn write_at(f: &std::fs::File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        return f.write_all_at(buf, off);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut written = 0usize;
+        while written < buf.len() {
+            match f.seek_write(&buf[written..], off + written as u64) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "seek_write wrote 0 bytes",
+                    ))
+                }
+                Ok(n) => written += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = f;
+        f.seek(SeekFrom::Start(off))?;
+        f.write_all(buf)
+    }
+}
+
 fn is_fatal_auth<E: std::fmt::Display>(e: &E) -> bool {
     let s = e.to_string();
     s.contains("USER_DEACTIVATED")

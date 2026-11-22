@@ -1,0 +1,33 @@
+name: windows
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build
+        run: cargo build --release --locked
+
+      - name: package portable exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\tgrab.exe dist\tgrab.exe
+          $size = (Get-Item dist\tgrab.exe).Length
+          Write-Host "tgrab.exe = $size bytes"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tgrab-windows
+          path: dist/tgrab.exe
+          if-no-files-found: error

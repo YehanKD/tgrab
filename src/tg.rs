@@ -575,11 +575,15 @@ async fn run(
                                         break;
                                     }
                                     Err(e) => {
+                                        eprintln!("[dl] {key} attempt {} failed: {e}", attempt + 1);
                                         let now = std::time::Instant::now();
                                         let dl = *deadline.get_or_insert(
                                             now + std::time::Duration::from_secs(RETRY_WINDOW_SECS),
                                         );
-                                        if is_fatal_auth(&e) {
+                                        if is_fatal_auth(&e)
+                                            || e.contains("CDN-served")
+                                            || e.starts_with("unavailable:")
+                                        {
                                             let _ = tx2.send(Ev::Fail { key, err: e });
                                             break;
                                         }
@@ -752,6 +756,7 @@ async fn download_one(
                 it = it.skip_chunks(p as i32);
             }
             let mut idx = p;
+            let mut first_read = true;
             let mut last = Instant::now();
             let mut acc = 0u64;
 
@@ -762,6 +767,15 @@ async fn download_one(
                 }
                 match it.next().await {
                     Ok(Some(data)) => {
+                        if first_read {
+                            first_read = false;
+                            if p == 0 {
+                                eprintln!(
+                                    "[dl] {key} first chunk {}B at idx {idx}/{total_chunks} (size {size}, parts {parts})",
+                                    data.len()
+                                );
+                            }
+                        }
                         let off = (idx * CHUNK) as u64;
                         if let Err(e) = write_at(&f, &data, off) {
                             let _ = tx.send(Ev::Fail { key, err: format!("write: {e}") });
@@ -777,8 +791,14 @@ async fn download_one(
                             ctx.request_repaint();
                         }
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        if p == 0 {
+                            eprintln!("[dl] {key} iterator returned None at idx {idx}/{total_chunks} (size {size})");
+                        }
+                        break;
+                    }
                     Err(e) => {
+                        eprintln!("[dl] {key} read failed at idx {idx}/{total_chunks}: {e}");
                         let _ = tx.send(Ev::Fail { key, err: format!("{e}") });
                         return;
                     }
@@ -811,6 +831,14 @@ async fn download_one(
 
     // Every worker can exit early (Ok(None), short chunks) without an error, so
     // trust the byte count, not the file size: set_len already faked the size.
+    let got = written.load(std::sync::atomic::Ordering::Relaxed);
+    if size > 0 && got == 0 {
+        // Telegram returned not a single byte: deleted media, an empty document,
+        // or a location the account cannot read. Waiting five minutes and asking
+        // again produces exactly the same empty answer.
+        let _ = std::fs::remove_file(&part_path);
+        return Err("unavailable: server returned no data".into());
+    }
     let missing = (0..total_chunks)
         .filter(|i| !seen[*i].load(std::sync::atomic::Ordering::Relaxed))
         .count();
@@ -820,7 +848,6 @@ async fn download_one(
             "incomplete: {missing} of {total_chunks} chunks missing"
         ));
     }
-    let got = written.load(std::sync::atomic::Ordering::Relaxed);
     if size > 0 && got != size {
         let _ = std::fs::remove_file(&part_path);
         return Err(format!("incomplete: {got} of {size} bytes"));

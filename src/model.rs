@@ -130,6 +130,7 @@ pub enum Ev {
         key: String,
         attempt: u32,
         wait: u64,
+        left: u64,
         err: String,
     },
     Prog {

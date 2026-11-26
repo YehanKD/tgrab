@@ -559,6 +559,8 @@ async fn run(
                             }
                             let _permit = sem.acquire_owned().await;
                             let mut attempt: u32 = 0;
+                            // Five minutes of retrying per file, starting at the first failure.
+                            let mut deadline: Option<std::time::Instant> = None;
                             loop {
                                 let r = download_one(
                                     c.clone(), media.clone(), size, path.clone(),
@@ -573,16 +575,33 @@ async fn run(
                                         break;
                                     }
                                     Err(e) => {
-                                        if is_fatal_auth(&e) || attempt >= MAX_RETRIES {
+                                        let now = std::time::Instant::now();
+                                        let dl = *deadline.get_or_insert(
+                                            now + std::time::Duration::from_secs(RETRY_WINDOW_SECS),
+                                        );
+                                        if is_fatal_auth(&e) {
                                             let _ = tx2.send(Ev::Fail { key, err: e });
                                             break;
                                         }
+                                        if now >= dl {
+                                            let _ = tx2.send(Ev::Fail {
+                                                key,
+                                                err: format!(
+                                                    "{e} — gave up after {} min",
+                                                    RETRY_WINDOW_SECS / 60
+                                                ),
+                                            });
+                                            break;
+                                        }
                                         attempt += 1;
-                                        let wait = retry_delay(attempt);
+                                        let left = dl.saturating_duration_since(now).as_secs();
+                                        // Never sleep past the deadline waiting for a retry.
+                                        let wait = retry_delay(attempt).min(left.max(1));
                                         let _ = tx2.send(Ev::Retry {
                                             key: key.clone(),
                                             attempt,
                                             wait,
+                                            left,
                                             err: e,
                                         });
                                         ctx2.request_repaint();
@@ -854,7 +873,8 @@ fn write_at(f: &std::fs::File, buf: &[u8], off: u64) -> std::io::Result<()> {
     }
 }
 
-const MAX_RETRIES: u32 = 10;
+/// Keep retrying one file for this long before giving up on it.
+const RETRY_WINDOW_SECS: u64 = 300;
 
 /// Network drops, flood waits and half-finished transfers all get retried;
 /// permanent ones (bad file reference, auth) do not.

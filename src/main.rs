@@ -310,12 +310,16 @@ impl App {
                         format!("forwarding… {done}/{total}")
                     };
                 }
-                Ev::Retry { key, attempt, wait, err } => {
+                Ev::Retry { key, attempt, wait, left, err } => {
                     if let Some(&i) = self.qidx.get(&key) {
                         self.queue[i].state = QState::Retry(attempt);
                         self.queue[i].done = 0;
                     }
-                    self.status = format!("retry {attempt} in {wait}s — {err}");
+                    self.status = format!(
+                        "retry {attempt} in {wait}s ({}:{:02} left) — {err}",
+                        left / 60,
+                        left % 60
+                    );
                 }
                 Ev::Skipped { key, path: _ } => {
                     if let Some(&i) = self.qidx.get(&key) {

@@ -733,6 +733,7 @@ async fn download_one(
     let parts = parts.clamp(1, 16).min(total_chunks);
     // One flag per chunk: proves every offset was written, not just that the
     // byte count adds up (a worker can write the same chunk twice and skip one).
+    let first_err: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     let seen: Arc<Vec<std::sync::atomic::AtomicBool>> = Arc::new(
         (0..total_chunks)
             .map(|_| std::sync::atomic::AtomicBool::new(false))
@@ -746,6 +747,7 @@ async fn download_one(
         let f = Arc::clone(&f);
         let written_bytes = Arc::clone(&written);
         let seen = Arc::clone(&seen);
+        let first_err = Arc::clone(&first_err);
         let key = key.clone();
         let tx = tx.clone();
         let ctx = ctx.clone();
@@ -799,6 +801,11 @@ async fn download_one(
                     }
                     Err(e) => {
                         eprintln!("[dl] {key} read failed at idx {idx}/{total_chunks}: {e}");
+                        if let Ok(mut slot) = first_err.lock() {
+                            if slot.is_none() {
+                                *slot = Some(e.to_string());
+                            }
+                        }
                         let _ = tx.send(Ev::Fail { key, err: format!("{e}") });
                         return;
                     }
@@ -837,7 +844,23 @@ async fn download_one(
         // or a location the account cannot read. Waiting five minutes and asking
         // again produces exactly the same empty answer.
         let _ = std::fs::remove_file(&part_path);
-        return Err("unavailable: server returned no data".into());
+        let raw = first_err
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_default();
+        // Say why. A file whose uploader was banned is not a network problem and
+        // will never become fetchable, no matter how long we retry.
+        let reason = if raw.contains("USER_DEACTIVATED_BAN") {
+            "uploader account was banned".to_string()
+        } else if raw.contains("MEDIA_FILE_INVALID") {
+            "media is invalid on Telegram's side".to_string()
+        } else if raw.is_empty() {
+            "server returned no data".to_string()
+        } else {
+            raw
+        };
+        return Err(format!("unavailable: {reason}"));
     }
     let missing = (0..total_chunks)
         .filter(|i| !seen[*i].load(std::sync::atomic::Ordering::Relaxed))

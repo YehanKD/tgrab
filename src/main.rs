@@ -42,6 +42,7 @@ enum QState {
     Run,
     Ok,
     Skip,
+    Retry(u32),
     Err(String),
 }
 
@@ -104,7 +105,10 @@ struct App {
     sort: SortMode,
     pick_rx: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
     dl_bytes: u64,
-    speed: std::collections::VecDeque<(std::time::Instant, u64)>,
+    speed_mbps: f64,
+    speed_bytes: u64,
+    speed_at: std::time::Instant,
+    speed_touched: std::time::Instant,
     fwd_open: bool,
     fwd_filter: String,
     fwd_target: Option<usize>,
@@ -151,11 +155,15 @@ impl App {
             sort: SortMode::Newest,
             pick_rx: None,
             dl_bytes: 0,
-            speed: std::collections::VecDeque::new(),
+            speed_mbps: 0.0,
+            speed_bytes: 0,
+            speed_at: std::time::Instant::now(),
+            speed_touched: std::time::Instant::now(),
             fwd_open: false,
             fwd_filter: String::new(),
             fwd_target: None,
             fwd_groups: false,
+            
             limit: 500,
             queue: Vec::new(),
             qidx: HashMap::new(),
@@ -302,6 +310,13 @@ impl App {
                         format!("forwarding… {done}/{total}")
                     };
                 }
+                Ev::Retry { key, attempt, wait, err } => {
+                    if let Some(&i) = self.qidx.get(&key) {
+                        self.queue[i].state = QState::Retry(attempt);
+                        self.queue[i].done = 0;
+                    }
+                    self.status = format!("retry {attempt} in {wait}s — {err}");
+                }
                 Ev::Skipped { key, path: _ } => {
                     if let Some(&i) = self.qidx.get(&key) {
                         let r = &mut self.queue[i];
@@ -383,6 +398,29 @@ impl App {
         self.base_dir().join(safe_dir_name(name, chat))
     }
 
+    /// Smooth the throughput readout. The raw per-frame delta is zero between
+    /// chunks, which made the label flip between "12.3 MB/s" and nothing many
+    /// times a second — that flicker is what looked like blinking.
+    fn update_speed(&mut self) {
+        let now = std::time::Instant::now();
+        if self.dl_bytes > self.speed_bytes {
+            let dt = now.duration_since(self.speed_at).as_secs_f64().max(0.001);
+            let inst = (self.dl_bytes - self.speed_bytes) as f64 / dt / 1_000_000.0;
+            self.speed_mbps = if self.speed_mbps <= 0.0 {
+                inst
+            } else {
+                0.75 * self.speed_mbps + 0.25 * inst
+            };
+            self.speed_bytes = self.dl_bytes;
+            self.speed_at = now;
+            self.speed_touched = now;
+        } else if self.speed_mbps > 0.0
+            && now.duration_since(self.speed_touched).as_millis() > 1200
+        {
+            self.speed_mbps = 0.0;
+        }
+    }
+
     fn start_download(&mut self, ids: Vec<i32>) {
         let Some(chat) = self.media_chat else { return };
         if ids.is_empty() {
@@ -426,6 +464,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let had = self.pump();
+        self.update_speed();
         self.frames += 1;
         if cfg!(debug_assertions) && self.frames % 50 == 0 {
             eprintln!("[ui] frame {} had={} phase={:?}", self.frames, had, self.phase as u8);
@@ -584,44 +623,21 @@ impl eframe::App for App {
                         ui.label(format!("{done} done, {failed} failed"));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Realtime throughput: sliding ~600 ms window over byte deltas,
-                        // recomputed every frame rather than on a 1 s tick.
-                        let now = std::time::Instant::now();
-                        self.speed.push_back((now, self.dl_bytes));
-                        while self.speed.len() > 2
-                            && now.duration_since(self.speed[0].0).as_millis() > 600
-                        {
-                            self.speed.pop_front();
-                        }
-                        let (t0, b0) = *self.speed.front().unwrap_or(&(now, self.dl_bytes));
-                        let dt = now.duration_since(t0).as_secs_f64();
-                        let mbps = if dt > 0.10 && self.dl_bytes > b0 {
-                            (self.dl_bytes - b0) as f64 / dt / 1_000_000.0
-                        } else {
-                            0.0
-                        };
-                        if mbps > 0.0 {
-                            ui.label(
-                                egui::RichText::new(format!("{mbps:.1} MB/s"))
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(120, 205, 255)),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{:.0} MB",
-                                    self.dl_bytes as f64 / 1_000_000.0
-                                ))
-                                .weak(),
-                            );
-                        } else if self.dl_bytes > 0 {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{:.0} MB",
-                                    self.dl_bytes as f64 / 1_000_000.0
-                                ))
-                                .weak(),
-                            );
-                        }
+                        // Throughput, smoothed and always rendered at a fixed width so the
+                        // row never re-layouts as bytes trickle in.
+                        ui.label(
+                            egui::RichText::new(format!("{:6.1} MB/s", self.speed_mbps))
+                                .monospace()
+                                .color(egui::Color32::from_rgb(120, 205, 255)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:8.1} MB",
+                                self.dl_bytes as f64 / 1_000_000.0
+                            ))
+                            .monospace()
+                            .weak(),
+                        );
                         if ui.button("Open folder").clicked() {
                             let d = match self.media_chat {
                                 Some(c) => self.chat_dir(c),
@@ -660,13 +676,17 @@ impl eframe::App for App {
                                 match &q.state {
                                     QState::Ok => ui.colored_label(
                                         egui::Color32::from_rgb(90, 200, 120),
-                                        "ok",
+                                        "✓ verified",
                                     ),
                                     QState::Err(e) => ui.colored_label(
                                         egui::Color32::from_rgb(230, 100, 100),
                                         e,
                                     ),
                                     QState::Run => ui.label("downloading"),
+                                    QState::Retry(n) => ui.colored_label(
+                                        egui::Color32::from_rgb(235, 175, 80),
+                                        format!("retry #{n}"),
+                                    ),
                                     QState::Skip => ui.colored_label(
                                         egui::Color32::from_rgb(150, 150, 160),
                                         "skipped (on disk)",
@@ -803,6 +823,16 @@ impl eframe::App for App {
                     self.fwd_open = true;
                     self.fwd_target = None;
                     self.fwd_filter.clear();
+                }
+                let paused = model::paused();
+                let label = if paused { "▶ Resume" } else { "⏸ Pause" };
+                if ui
+                    .button(label)
+                    .on_hover_text("stop and restart the transfer without losing the queue")
+                    .clicked()
+                {
+                    model::set_paused(!paused);
+                    self.status = if paused { "resumed".into() } else { "paused".into() };
                 }
             });
             ui.horizontal(|ui| {

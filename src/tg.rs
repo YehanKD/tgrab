@@ -553,14 +553,41 @@ async fn run(
                         let tx2 = tx.clone();
                         let ctx2 = ctx.clone();
                         handles.push(tokio::spawn(async move {
+                            // Don't start a file while paused: no slot, no request.
+                            while crate::model::paused() {
+                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            }
                             let _permit = sem.acquire_owned().await;
-                            let r = download_one(c, media, size, path.clone(), key.clone(), parts, tx2.clone(), ctx2).await;
-                            match r {
-                                Ok(()) => {
-                                    let _ = tx2.send(Ev::Done { key, path: path.display().to_string() });
-                                }
-                                Err(e) => {
-                                    let _ = tx2.send(Ev::Fail { key, err: e });
+                            let mut attempt: u32 = 0;
+                            loop {
+                                let r = download_one(
+                                    c.clone(), media.clone(), size, path.clone(),
+                                    key.clone(), parts, tx2.clone(), ctx2.clone(),
+                                ).await;
+                                match r {
+                                    Ok(()) => {
+                                        let _ = tx2.send(Ev::Done {
+                                            key: key.clone(),
+                                            path: path.display().to_string(),
+                                        });
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        if is_fatal_auth(&e) || attempt >= MAX_RETRIES {
+                                            let _ = tx2.send(Ev::Fail { key, err: e });
+                                            break;
+                                        }
+                                        attempt += 1;
+                                        let wait = retry_delay(attempt);
+                                        let _ = tx2.send(Ev::Retry {
+                                            key: key.clone(),
+                                            attempt,
+                                            wait,
+                                            err: e,
+                                        });
+                                        ctx2.request_repaint();
+                                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                                    }
                                 }
                             }
                         }));
@@ -681,6 +708,13 @@ async fn download_one(
     let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let total_chunks = ((size as usize).div_ceil(CHUNK)).max(1);
     let parts = parts.clamp(1, 16).min(total_chunks);
+    // One flag per chunk: proves every offset was written, not just that the
+    // byte count adds up (a worker can write the same chunk twice and skip one).
+    let seen: Arc<Vec<std::sync::atomic::AtomicBool>> = Arc::new(
+        (0..total_chunks)
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
+            .collect(),
+    );
 
     let mut handles = Vec::new();
     for p in 0..parts {
@@ -688,6 +722,7 @@ async fn download_one(
         let media = media.clone();
         let f = Arc::clone(&f);
         let written_bytes = Arc::clone(&written);
+        let seen = Arc::clone(&seen);
         let key = key.clone();
         let tx = tx.clone();
         let ctx = ctx.clone();
@@ -702,6 +737,10 @@ async fn download_one(
             let mut acc = 0u64;
 
             while idx < total_chunks {
+                // Idle here while paused: no new requests, no writes.
+                while crate::model::paused() {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
                 match it.next().await {
                     Ok(Some(data)) => {
                         let off = (idx * CHUNK) as u64;
@@ -709,6 +748,7 @@ async fn download_one(
                             let _ = tx.send(Ev::Fail { key, err: format!("write: {e}") });
                             return;
                         }
+                        seen[idx].store(true, std::sync::atomic::Ordering::Relaxed);
                         acc += data.len() as u64;
                         written_bytes.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         if last.elapsed() >= Duration::from_millis(120) {
@@ -752,6 +792,15 @@ async fn download_one(
 
     // Every worker can exit early (Ok(None), short chunks) without an error, so
     // trust the byte count, not the file size: set_len already faked the size.
+    let missing = (0..total_chunks)
+        .filter(|i| !seen[*i].load(std::sync::atomic::Ordering::Relaxed))
+        .count();
+    if size > 0 && missing > 0 {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(format!(
+            "incomplete: {missing} of {total_chunks} chunks missing"
+        ));
+    }
     let got = written.load(std::sync::atomic::Ordering::Relaxed);
     if size > 0 && got != size {
         let _ = std::fs::remove_file(&part_path);
@@ -802,6 +851,23 @@ fn write_at(f: &std::fs::File, buf: &[u8], off: u64) -> std::io::Result<()> {
         let mut f = f;
         f.seek(SeekFrom::Start(off))?;
         f.write_all(buf)
+    }
+}
+
+const MAX_RETRIES: u32 = 10;
+
+/// Network drops, flood waits and half-finished transfers all get retried;
+/// permanent ones (bad file reference, auth) do not.
+fn retry_delay(attempt: u32) -> u64 {
+    match attempt {
+        1 => 2,
+        2 => 3,
+        3 => 5,
+        4 => 8,
+        5 => 13,
+        6 => 21,
+        7 => 30,
+        _ => 60,
     }
 }
 

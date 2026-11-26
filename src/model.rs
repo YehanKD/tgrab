@@ -39,6 +39,17 @@ pub struct MediaRow {
     pub selected: bool,
 }
 
+/// Set by the UI, read by every download worker. Workers idle while true.
+pub static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn paused() -> bool {
+    PAUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_paused(v: bool) {
+    PAUSED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub enum Cmd {
     Connect {
         api_id: i32,
@@ -114,6 +125,12 @@ pub enum Ev {
         done: usize,
         total: usize,
         failed: usize,
+    },
+    Retry {
+        key: String,
+        attempt: u32,
+        wait: u64,
+        err: String,
     },
     Prog {
         key: String,

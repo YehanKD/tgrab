@@ -427,7 +427,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let had = self.pump();
         self.frames += 1;
-        if self.frames % 50 == 0 {
+        if cfg!(debug_assertions) && self.frames % 50 == 0 {
             eprintln!("[ui] frame {} had={} phase={:?}", self.frames, had, self.phase as u8);
         }
         if had || self.phase != Phase::Ready || self.downloading || (self.chats.is_empty() && self.me.is_some()) {

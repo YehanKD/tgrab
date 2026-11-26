@@ -661,11 +661,24 @@ async fn download_one(
     tx: Sender<Ev>,
     ctx: egui::Context,
 ) -> Result<(), String> {
-    let f = std::fs::File::create(&path).map_err(|e| format!("create: {e}"))?;
+    // Write into <name>.part and only rename on success. A preallocated file at
+    // the final path looks "complete" to the size check even when not one byte
+    // landed, which is how a killed transfer turned into a permanent zero-filled
+    // stub that later runs skipped forever.
+    let part_path = {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "download".into());
+        path.with_file_name(format!("{name}.part"))
+    };
+    let _ = std::fs::remove_file(&part_path);
+    let f = std::fs::File::create(&part_path).map_err(|e| format!("create: {e}"))?;
     if size > 0 {
         f.set_len(size).map_err(|e| format!("alloc: {e}"))?;
     }
     let f = Arc::new(f);
+    let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let total_chunks = ((size as usize).div_ceil(CHUNK)).max(1);
     let parts = parts.clamp(1, 16).min(total_chunks);
 
@@ -674,6 +687,7 @@ async fn download_one(
         let client = client.clone();
         let media = media.clone();
         let f = Arc::clone(&f);
+        let written_bytes = Arc::clone(&written);
         let key = key.clone();
         let tx = tx.clone();
         let ctx = ctx.clone();
@@ -696,6 +710,7 @@ async fn download_one(
                             return;
                         }
                         acc += data.len() as u64;
+                        written_bytes.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         if last.elapsed() >= Duration::from_millis(120) {
                             let _ = tx.send(Ev::Prog { key: key.clone(), done: acc, total: size });
                             acc = 0;
@@ -725,12 +740,29 @@ async fn download_one(
         match h.await {
             Ok(()) => {}
             Err(e) if e.is_panic() => {
-                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(&part_path);
                 return Err("CDN-served file - grammers cannot follow the redirect".into());
             }
-            Err(e) => return Err(e.to_string()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&part_path);
+                return Err(e.to_string());
+            }
         }
     }
+
+    // Every worker can exit early (Ok(None), short chunks) without an error, so
+    // trust the byte count, not the file size: set_len already faked the size.
+    let got = written.load(std::sync::atomic::Ordering::Relaxed);
+    if size > 0 && got != size {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(format!("incomplete: {got} of {size} bytes"));
+    }
+    let on_disk = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+    if size > 0 && on_disk != size {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(format!("incomplete on disk: {on_disk} of {size} bytes"));
+    }
+    std::fs::rename(&part_path, &path).map_err(|e| format!("rename: {e}"))?;
     Ok(())
 }
 

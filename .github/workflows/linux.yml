@@ -1,0 +1,88 @@
+name: linux
+
+# Builds a portable AppImage on Ubuntu 22.04 (glibc 2.35) so it runs on older
+# distros too. No FUSE needed to build: appimagetool runs with
+# --appimage-extract-and-run.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  appimage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libfontconfig1-dev
+
+      - name: build
+        run: cargo build --release --locked
+
+      - name: build AppDir
+        run: |
+          set -e
+          VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          rm -rf AppDir dist
+          mkdir -p AppDir/usr/bin dist
+          cp target/release/tgrab AppDir/usr/bin/tgrab
+
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/tgrab" "$@"
+          EOF
+          chmod 755 AppDir/AppRun
+
+          cat > AppDir/tgrab.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=tgrab
+          GenericName=Telegram media archiver
+          Comment=Fast native Telegram media archiver
+          Exec=tgrab
+          Icon=tgrab
+          Terminal=false
+          Categories=Utility;
+          EOF
+
+          cp assets/icon.png AppDir/tgrab.png
+          echo "version $VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: package AppImage
+        run: |
+          set -e
+          curl -sSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 VERSION="$VERSION" ./appimagetool --appimage-extract-and-run \
+            AppDir "dist/tgrab-${VERSION}-x86_64.AppImage"
+
+      - name: smoke test
+        run: |
+          set -e
+          cd dist
+          chmod +x ./*.AppImage
+          ./*.AppImage --appimage-extract >/dev/null
+          test -x squashfs-root/usr/bin/tgrab
+          ls -lh squashfs-root/usr/bin/tgrab
+          ls -lh ./*.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tgrab-linux
+          path: dist/*.AppImage
+          if-no-files-found: error

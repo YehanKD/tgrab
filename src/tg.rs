@@ -546,6 +546,10 @@ async fn run(
                         eprintln!("[dl] skipped {} already on disk", skipped);
                     }
                     let sem = Arc::new(tokio::sync::Semaphore::new(concurrent.clamp(1, 16)));
+                    // A channel that Telegram has blocked refuses every file with the
+                    // same 401. Stop after a few instead of producing one failure per file.
+                    let banned_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let ok_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     let mut handles = Vec::new();
                     let dl_peer = *peers.get(chat).ok_or_else(|| anyhow::anyhow!("bad chat"))?;
                     for (key, msg_id, media, size, path) in jobs {
@@ -553,12 +557,24 @@ async fn run(
                         let sem = Arc::clone(&sem);
                         let tx2 = tx.clone();
                         let ctx2 = ctx.clone();
+                        let banned_hits = Arc::clone(&banned_hits);
+                        let ok_hits = Arc::clone(&ok_hits);
                         handles.push(tokio::spawn(async move {
                             // Don't start a file while paused: no slot, no request.
                             while crate::model::paused() {
                                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                             }
                             let _permit = sem.acquire_owned().await;
+                            if banned_hits.load(std::sync::atomic::Ordering::Relaxed) >= 5
+                                && ok_hits.load(std::sync::atomic::Ordering::Relaxed) == 0
+                            {
+                                let _ = tx2.send(Ev::Fail {
+                                    key,
+                                    err: "channel blocked by Telegram — its files cannot be fetched"
+                                        .into(),
+                                });
+                                return;
+                            }
                             let mut attempt: u32 = 0;
                             // Five minutes of retrying per file, starting at the first failure.
                             let mut deadline: Option<std::time::Instant> = None;
@@ -585,6 +601,7 @@ async fn run(
                                 ).await;
                                 match r {
                                     Ok(()) => {
+                                        ok_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         let _ = tx2.send(Ev::Done {
                                             key: key.clone(),
                                             path: path.display().to_string(),
@@ -593,6 +610,12 @@ async fn run(
                                     }
                                     Err(e) => {
                                         eprintln!("[dl] {key} attempt {} failed: {e}", attempt + 1);
+                                        if e.contains("USER_DEACTIVATED_BAN")
+                                            || e.contains("file reference rejected")
+                                        {
+                                            banned_hits
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
                                         let now = std::time::Instant::now();
                                         let dl = *deadline.get_or_insert(
                                             now + std::time::Duration::from_secs(RETRY_WINDOW_SECS),

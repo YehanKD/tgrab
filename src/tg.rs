@@ -540,14 +540,15 @@ async fn run(
                             });
                             continue;
                         }
-                        jobs.push((key, media, size, path));
+                        jobs.push((key, m.id(), media, size, path));
                     }
                     if skipped > 0 {
                         eprintln!("[dl] skipped {} already on disk", skipped);
                     }
                     let sem = Arc::new(tokio::sync::Semaphore::new(concurrent.clamp(1, 16)));
                     let mut handles = Vec::new();
-                    for (key, media, size, path) in jobs {
+                    let dl_peer = *peers.get(chat).ok_or_else(|| anyhow::anyhow!("bad chat"))?;
+                    for (key, msg_id, media, size, path) in jobs {
                         let c = c.clone();
                         let sem = Arc::clone(&sem);
                         let tx2 = tx.clone();
@@ -562,8 +563,24 @@ async fn run(
                             // Five minutes of retrying per file, starting at the first failure.
                             let mut deadline: Option<std::time::Instant> = None;
                             loop {
+                                // Re-fetch the message before every attempt. File references
+                                // expire (~1h) and a queue this long outlives them; the official
+                                // clients refresh the same way. A stale reference is what
+                                // surfaces as 401 USER_DEACTIVATED_BAN / MEDIA_FILE_INVALID.
+                                let fresh = match c.get_messages_by_id(dl_peer, &[msg_id]).await {
+                                    Ok(list) => list
+                                        .into_iter()
+                                        .next()
+                                        .flatten()
+                                        .and_then(|m| m.media()),
+                                    Err(e) => {
+                                        eprintln!("[dl] {key} refresh failed: {e}");
+                                        None
+                                    }
+                                };
+                                let media_now = fresh.unwrap_or_else(|| media.clone());
                                 let r = download_one(
-                                    c.clone(), media.clone(), size, path.clone(),
+                                    c.clone(), media_now, size, path.clone(),
                                     key.clone(), parts, tx2.clone(), ctx2.clone(),
                                 ).await;
                                 match r {
@@ -852,7 +869,7 @@ async fn download_one(
         // Say why. A file whose uploader was banned is not a network problem and
         // will never become fetchable, no matter how long we retry.
         let reason = if raw.contains("USER_DEACTIVATED_BAN") {
-            "uploader account was banned".to_string()
+            "file reference rejected (stale reference or dead uploader)".to_string()
         } else if raw.contains("MEDIA_FILE_INVALID") {
             "media is invalid on Telegram's side".to_string()
         } else if raw.is_empty() {

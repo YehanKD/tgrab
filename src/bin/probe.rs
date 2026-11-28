@@ -81,6 +81,50 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Forward to Saved Messages, then try to fetch the copy. Tests whether the
+    // block travels with the document or stays with the channel.
+    if args.get(3).map(|s| s.as_str()) == Some("forward") {
+        let me = client.get_me().await?;
+        let me_id = me.id().bare_id();
+        let mut self_ref = None;
+        let mut d2 = client.iter_dialogs();
+        while let Some(dd) = d2.next().await? {
+            if matches!(&dd.peer, grammers_client::peer::Peer::User(_))
+                && dd.peer_ref().id.bare_id() == me_id
+            {
+                self_ref = Some(dd.peer_ref());
+                break;
+            }
+        }
+        let Some(me_ref) = self_ref else {
+            println!("self chat not found in dialogs");
+            return Ok(());
+        };
+        println!("forwarding {} from {:?} to saved messages...", msg_id, want);
+        match client.forward_messages(me_ref, &[msg_id], peer).await {
+            Ok(list) => {
+                match list.into_iter().next().flatten() {
+                    Some(m) => {
+                        println!("forwarded ok, new id {}", m.id());
+                        if let Some(media) = m.media() {
+                            let mut dl = client.iter_download(&media).chunk_size(512 * 1024);
+                            match dl.next().await {
+                                Ok(Some(b)) => println!("SAVED COPY: OK {} bytes", b.len()),
+                                Ok(None) => println!("SAVED COPY: EMPTY"),
+                                Err(e) => println!("SAVED COPY: ERR {e:?}"),
+                            }
+                        } else {
+                            println!("forwarded message has no media");
+                        }
+                    }
+                    None => println!("forward returned nothing"),
+                }
+            }
+            Err(e) => println!("forward failed: {e:?}"),
+        }
+        return Ok(());
+    }
+
     let msgs = client.get_messages_by_id(peer, &[msg_id]).await?;
     let Some(Some(m)) = msgs.into_iter().next() else {
         println!("message {msg_id} not returned");

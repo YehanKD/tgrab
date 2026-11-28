@@ -264,6 +264,7 @@ async fn run(
                 Cmd::LoadChats => {
                     let c = client.as_ref().ok_or_else(|| anyhow::anyhow!("not connected"))?;
                     eprintln!("[chats] loading dialogs...");
+                    let me_id = c.get_me().await.ok().and_then(|u| u.id().bare_id());
                     let fut = async {
                         let mut iter = c.iter_dialogs();
                         let mut rows = Vec::new();
@@ -277,15 +278,23 @@ async fn run(
                                 Peer::User(_) => "user",
                                 Peer::Community(_) => "group",
                             };
-                            let name = match d.peer.name() {
-                                Some(n) => n.to_string(),
-                                None => match d.peer.username() {
-                                    Some(u) => format!("@{u}"),
-                                    None => format!(
-                                        "{kind} {}",
-                                        d.peer_ref().id.bare_id().unwrap_or(0)
-                                    ),
-                                },
+                            let is_self = me_id.is_some()
+                                && matches!(&d.peer, Peer::User(_))
+                                && d.peer_ref().id.bare_id() == me_id;
+                            let kind = if is_self { "saved" } else { kind };
+                            let name = if is_self {
+                                "📥 Saved Messages".to_string()
+                            } else {
+                                match d.peer.name() {
+                                    Some(n) => n.to_string(),
+                                    None => match d.peer.username() {
+                                        Some(u) => format!("@{u}"),
+                                        None => format!(
+                                            "{kind} {}",
+                                            d.peer_ref().id.bare_id().unwrap_or(0)
+                                        ),
+                                    },
+                                }
                             };
                             let idx = ps.len();
                             ps.push(d.peer_ref());
@@ -305,7 +314,8 @@ async fn run(
                     rows.sort_by(|a, b| {
                         fn rank(k: &str) -> u8 {
                             match k {
-                                "channel" => 0,
+                                "saved" => 0,
+                                "channel" => 1,
                                 "group" => 1,
                                 _ => 2,
                             }
